@@ -1,7 +1,7 @@
 # fdat_rd — FDAT body + rectangular alternating windows + token-dictionary
 # cross-attention (spandrel arch). Self-contained: bundled upsampler stack &
 # DropPath, imports only StateDict + store_hyperparameters from spandrel
-# (matches fdat2; no spandrel.util.timm / einops / numpy).
+# (no spandrel.util.timm / einops / numpy).
 from __future__ import annotations
 
 import math
