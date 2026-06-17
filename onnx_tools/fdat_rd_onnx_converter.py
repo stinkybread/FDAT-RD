@@ -2,7 +2,7 @@
 """
 FDAT-RD Model Converter
 ========================
-Standalone onnx converter for FDAT-RD (fdat_rd): FDAT + rectangular alternating
+Standalone converter for FDAT-RD (fdat_rd): FDAT + rectangular alternating
 windows + token-dictionary cross-attention, dense spatial bias. The embedded
 arch uses manual softmax attention (training arch uses SDPA) - identical
 weights, cleanest export graph.
@@ -11,14 +11,14 @@ Converts: PyTorch (.pth/.pt), SafeTensors, ONNX (static / dynamic).
 
 Usage:
     # 2x unshuffle, 720x540 input -> 1080p, static ONNX (H W = 540 720), verified:
-    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 540 720 --split-size 10 30
+    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720 --split-size 10 30
 
     # tiny aligned verify first, then big export on GPU, no verify:
-    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 60 60
-    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 540 720 --device cuda --no-verify
+    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 60 60
+    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720 --device cuda --no-verify
 
-    python fdat_rd_onnx_converter.py model.pth --info
-    python fdat_rd_onnx_converter.py model.pth -f all
+    python fdat_rd_converter.py model.pth --info
+    python fdat_rd_converter.py model.pth -f all
 
 Notes:
     * --split-size carries the rectangular factorization (default 10 30); the
@@ -327,7 +327,7 @@ class FastSpatialWindowAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         n = self.wh * self.ww
-        self.bias = nn.Parameter(torch.zeros(num_heads, n, n))
+        self.rel_pos_bias = nn.Parameter(torch.zeros(num_heads, n, n))
 
     def forward(self, x, H, W):
         B, L, C = x.shape
@@ -342,7 +342,7 @@ class FastSpatialWindowAttention(nn.Module):
         N = wh * ww
         qkv = self.qkv(x).reshape(-1, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = (q * self.scale @ k.transpose(-2, -1)) + self.bias
+        attn = (q * self.scale @ k.transpose(-2, -1)) + self.rel_pos_bias
         x = (F.softmax(attn, dim=-1) @ v).transpose(1, 2).reshape(-1, N, C)
         x = (self.proj(x).reshape(B, H_pad // wh, W_pad // ww, wh, ww, C)
              .permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, H_pad, W_pad, C))
@@ -567,11 +567,11 @@ def detect_model_params(sd, split_size):
         if b + "temp" in sd:
             p["num_heads"] = sd[b + "temp"].shape[0]
             break
-        if b + "bias" in sd:
-            p["num_heads"] = sd[b + "bias"].shape[0]
+        if b + "rel_pos_bias" in sd:
+            p["num_heads"] = sd[b + "rel_pos_bias"].shape[0]
             break
     for bi in range(len(types)):
-        b = f"groups.0.blocks.{bi}.attn.bias"
+        b = f"groups.0.blocks.{bi}.attn.rel_pos_bias"
         if b in sd:
             prod = sd[b].shape[1]
             if prod != s0 * s1:
