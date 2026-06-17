@@ -2,7 +2,7 @@
 """
 FDAT-RD Model Converter
 ========================
-Standalone converter for FDAT-RD (fdat_rd): FDAT + rectangular alternating
+Standalone onnx converter for FDAT-RD (fdat_rd): FDAT + rectangular alternating
 windows + token-dictionary cross-attention, dense spatial bias. The embedded
 arch uses manual softmax attention (training arch uses SDPA) - identical
 weights, cleanest export graph.
@@ -11,14 +11,14 @@ Converts: PyTorch (.pth/.pt), SafeTensors, ONNX (static / dynamic).
 
 Usage:
     # 2x unshuffle, 720x540 input -> 1080p, static ONNX (H W = 540 720), verified:
-    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720 --split-size 10 30
+    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 540 720 --split-size 10 30
 
     # tiny aligned verify first, then big export on GPU, no verify:
-    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 60 60
-    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720 --device cuda --no-verify
+    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 60 60
+    python fdat_rd_onnx_converter.py model.safetensors -f onnx-static --input-size 540 720 --device cuda --no-verify
 
-    python fdat_rd_converter.py model.pth --info
-    python fdat_rd_converter.py model.pth -f all
+    python fdat_rd_onnx_converter.py model.pth --info
+    python fdat_rd_onnx_converter.py model.pth -f all
 
 Notes:
     * --split-size carries the rectangular factorization (default 10 30); the
