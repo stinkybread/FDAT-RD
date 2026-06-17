@@ -4,9 +4,10 @@
 evolution of **FDAT** for cel-animation super-resolution (DVD/LD → BluRay),
 targeting TensorRT-static deployment via traiNNer-redux. It keeps every FDAT
 deployment invariant (static ONNX export, tensor-core alignment, reshape-over-
-view, no data-dependent control flow) while measurably improving recovery on the
-hardest frames — thin lineart, sub-pixel chroma in tight structures, eye/hair
-curves — the cases conventional models blur.
+view, no data-dependent control flow) while considerably improving recovery on the
+hardest frames — thin and blurred lineart, sub-pixel chroma in tight structures, degraded eye/hair
+curves - where spatial information is difficult to parse.
+
 
 ## Lineage
 
