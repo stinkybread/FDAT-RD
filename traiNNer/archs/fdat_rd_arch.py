@@ -1,5 +1,6 @@
 # ruff: noqa
 # type: ignore
+# https://github.com/stinkybread/FDAT-RD/blob/main/traiNNer/archs/fdat_rd_arch.py
 import math
 
 import torch
