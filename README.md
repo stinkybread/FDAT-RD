@@ -11,13 +11,13 @@ curves — the cases conventional models blur.
 ## Lineage
 
 ```
-FDAT
+FDAT - https://github.com/stinkybread/FDAT
  └─ rectangular alternating windows  (anisotropic lineart prior, resolution-aligned)
      └─ token-dictionary cross-attention  (global learned structure prior)
          └─ FDAT-RD
 ```
 
-FDAT is the body this builds on: residual groups alternating a windowed
+FDAT (https://github.com/stinkybread/FDAT) is the body this builds on: residual groups alternating a windowed
 **spatial** attention and a transposed **channel** (MDTA-style) attention, each
 fused with a depthwise-conv branch through the AIM gate and followed by a
 depthwise-mix FFN, with an unshuffle frontend and a `UniUpsampleV3` tail. It is
@@ -130,6 +130,7 @@ inference cost:
 
 - training throughput up (`fdat_rd_medium` ~1.8 it/s vs FDAT ~1.4 it/s, batch 16)
 - training VRAM down (~13.3 GB vs ~13.8 GB)
+- 9.8 FPS on 720x540p inference with Medium variant and Unshuffle Mod On with a 4080 RTX.
 - clearly improved detail recovery across crops (thin lineart, eye/hair)
 - ~20% slower at inference — the price of the `300`-token rectangular windows
   that don't tile to a multiple of 8; best evaluated against models at the same
