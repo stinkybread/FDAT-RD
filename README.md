@@ -129,8 +129,8 @@ network_g:
 Faster and lighter to train, clearly better on hard-case crops, at a modest
 inference cost:
 
-- training throughput up (`fdat_rd_medium` ~1.8 it/s vs FDAT ~1.4 it/s, batch 16)
-- training VRAM down (~13.3 GB vs ~13.8 GB)
+- training throughput up
+- training VRAM down
 - 9.8 FPS on 720x540p inference with Medium variant and Unshuffle Mod On with a 4080 RTX.
 - clearly improved detail recovery across crops (thin lineart, eye/hair)
 - ~20% slower at inference — the price of the `300`-token rectangular windows
