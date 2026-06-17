@@ -1,7 +1,7 @@
 # FDAT-RD
 
 `fdat_rd` (Fast Dual-Attention Transformer, Rectangular + Dictionary) is an
-evolution of **FDAT** for cel-animation super-resolution (DVD/LD → BluRay),
+evolution of **FDAT** prioritized for animation (but not only) super-resolution (DVD/LD → BluRay),
 targeting TensorRT-static deployment via traiNNer-redux. It keeps every FDAT
 deployment invariant (static ONNX export, tensor-core alignment, reshape-over-
 view, no data-dependent control flow) while considerably improving recovery on the
