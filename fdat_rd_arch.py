@@ -1,0 +1,314 @@
+# ruff: noqa
+# type: ignore
+import math
+
+import torch
+import torch.nn.functional as F  # noqa: N812
+from spandrel.__helpers.model_descriptor import StateDict
+from spandrel.util.timm import DropPath
+from torch import Tensor, nn
+from torch.nn.init import trunc_normal_
+from torch.nn.modules.module import _IncompatibleKeys  # type: ignore
+from torch.utils.checkpoint import checkpoint
+
+from traiNNer.archs.arch_util import SampleMods3, UniUpsampleV3
+from traiNNer.utils.registry import ARCH_REGISTRY
+
+
+class TokenDictionaryCrossAttention(nn.Module):
+    def __init__(self, dim, num_tokens=128, num_heads=4, qkv_bias=False) -> None:
+        super().__init__()
+        self.nh = num_heads
+        self.hd = dim // num_heads
+        self.num_tokens = num_tokens
+        self.dictionary = nn.Parameter(torch.zeros(num_tokens, dim))
+        trunc_normal_(self.dictionary, std=0.02)
+        self.r_q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.r_kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.r_norm = nn.LayerNorm(dim)
+        self.e_q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.e_kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def _mha(self, q, k, v):
+        B, Lq, C = q.shape
+        Lk = k.shape[1]
+        q = q.reshape(B, Lq, self.nh, self.hd).permute(0, 2, 1, 3)
+        k = k.reshape(B, Lk, self.nh, self.hd).permute(0, 2, 1, 3)
+        v = v.reshape(B, Lk, self.nh, self.hd).permute(0, 2, 1, 3)
+        out = F.scaled_dot_product_attention(q, k, v)
+        return out.permute(0, 2, 1, 3).reshape(B, Lq, C)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        d = self.dictionary.unsqueeze(0).expand(B, -1, -1)
+        rk, rv = self.r_kv(self.r_norm(x)).chunk(2, dim=-1)
+        d = d + self._mha(self.r_q(d), rk, rv)
+        ek, ev = self.e_kv(d).chunk(2, dim=-1)
+        return self.proj(self._mha(self.e_q(x), ek, ev))
+
+
+class FastSpatialWindowAttention(nn.Module):
+    def __init__(self, dim, window_size=(16, 16), num_heads=4, qkv_bias=False) -> None:
+        super().__init__()
+        self.dim = dim
+        self.wh, self.ww = window_size
+        self.nh = num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+        n = self.wh * self.ww
+        self.rel_pos_bias = nn.Parameter(torch.zeros(num_heads, n, n))
+        trunc_normal_(self.rel_pos_bias, std=0.02)
+
+    def forward(self, x, H, W):
+        B, L, C = x.shape
+        wh, ww = self.wh, self.ww
+        pad_b = (wh - H % wh) % wh
+        pad_r = (ww - W % ww) % ww
+        if pad_r > 0 or pad_b > 0:
+            x = F.pad(x.reshape(B, H, W, C), (0, 0, 0, pad_r, 0, pad_b)).reshape(B, -1, C)
+        H_pad, W_pad = H + pad_b, W + pad_r
+        x = (x.reshape(B, H_pad // wh, wh, W_pad // ww, ww, C)
+             .permute(0, 1, 3, 2, 4, 5).contiguous().reshape(-1, wh * ww, C))
+        N = wh * ww
+        qkv = self.qkv(x).reshape(-1, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=self.rel_pos_bias.unsqueeze(0))
+        x = out.transpose(1, 2).reshape(-1, N, C)
+        x = (self.proj(x).reshape(B, H_pad // wh, W_pad // ww, wh, ww, C)
+             .permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, H_pad, W_pad, C))
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+        return x.reshape(B, L, C)
+
+
+class FastChannelAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, qkv_bias=False) -> None:
+        super().__init__()
+        self.nh = num_heads
+        self.temp = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.nh, C // self.nh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = F.normalize(q.transpose(-2, -1), dim=-1)
+        k = F.normalize(k.transpose(-2, -1), dim=-1)
+        attn = F.softmax((q @ k.transpose(-2, -1)) * self.temp, dim=-1)
+        return self.proj((attn @ v.transpose(-2, -1)).permute(0, 3, 1, 2).reshape(B, N, C))
+
+
+class SimplifiedAIM(nn.Module):
+    def __init__(self, dim, reduction_ratio=8) -> None:
+        super().__init__()
+        self.sg = nn.Sequential(nn.Conv2d(dim, 1, 1, bias=False), nn.Sigmoid())
+        self.cg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim // reduction_ratio, 1, bias=False),
+            nn.GELU(), nn.Conv2d(dim // reduction_ratio, dim, 1, bias=False), nn.Sigmoid())
+
+    def forward(self, attn_feat, conv_feat, interaction_type, H, W):
+        B, L, C = attn_feat.shape
+        if interaction_type == "spatial_modulates_channel":
+            sm = self.sg(attn_feat.transpose(1, 2).reshape(B, C, H, W)).reshape(B, 1, L).transpose(1, 2)
+            return attn_feat + (conv_feat * sm)
+        cm = self.cg(conv_feat.transpose(1, 2).reshape(B, C, H, W)).reshape(B, C, 1).transpose(1, 2)
+        return (attn_feat * cm) + conv_feat
+
+
+class SimplifiedFFN(nn.Module):
+    def __init__(self, dim, expansion_ratio=2.0, drop=0.0) -> None:
+        super().__init__()
+        hd = int(dim * expansion_ratio)
+        self.fc1, self.act, self.fc2 = nn.Linear(dim, hd, False), nn.GELU(), nn.Linear(hd, dim, False)
+        self.drop = nn.Dropout(drop)
+        self.smix = nn.Conv2d(hd, hd, 3, 1, 1, groups=hd, bias=False)
+
+    def forward(self, x, H, W):
+        B, L, C = x.shape
+        x = self.drop(self.act(self.fc1(x)))
+        x_s = self.smix(x.transpose(1, 2).reshape(B, x.shape[-1], H, W)).reshape(B, x.shape[-1], L).transpose(1, 2)
+        return self.drop(self.fc2(x_s))
+
+
+class SimplifiedDATBlock(nn.Module):
+    def __init__(self, dim, nh, window_size, ffn_exp, aim_re, btype, dp, num_dict_tokens=128, qkv_b=False) -> None:
+        super().__init__()
+        self.btype = btype
+        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        if btype == "spatial":
+            self.attn = FastSpatialWindowAttention(dim, window_size, nh, qkv_b)
+        elif btype == "channel":
+            self.attn = FastChannelAttention(dim, nh, qkv_b)
+        else:
+            self.attn = TokenDictionaryCrossAttention(dim, num_dict_tokens, nh, qkv_b)
+        if btype != "dictionary":
+            self.conv = nn.Sequential(nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=False), nn.GELU())
+            self.inter = SimplifiedAIM(dim, aim_re)
+        self.dp = DropPath(dp) if dp > 0.0 else nn.Identity()
+        self.ffn = SimplifiedFFN(dim, ffn_exp)
+
+    def _conv_fwd(self, x, H, W):
+        B, L, C = x.shape
+        return self.conv(x.transpose(1, 2).reshape(B, C, H, W)).reshape(B, C, L).transpose(1, 2)
+
+    def forward(self, x, H, W):
+        if self.btype == "dictionary":
+            x = x + self.dp(self.attn(self.n1(x), H, W))
+            return x + self.dp(self.ffn(self.n2(x), H, W))
+        n1 = self.n1(x)
+        itype = "channel_modulates_spatial" if self.btype == "spatial" else "spatial_modulates_channel"
+        x = x + self.dp(self.inter(self.attn(n1, H, W), self._conv_fwd(n1, H, W), itype, H, W))
+        return x + self.dp(self.ffn(self.n2(x), H, W))
+
+
+class SimplifiedResidualGroup(nn.Module):
+    def __init__(self, dim, depth, nh, split_size, ffn_exp, aim_re, pattern, dp_rates,
+                 num_dict_tokens=128, start_parity=0, use_checkpoint=False) -> None:
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        s0, s1 = split_size
+        blocks, sp = [], start_parity
+        for i in range(depth):
+            btype = pattern[i % len(pattern)]
+            if btype == "spatial":
+                ws = (s0, s1) if sp % 2 == 0 else (s1, s0)
+                sp += 1
+            else:
+                ws = (s0, s1)
+            blocks.append(SimplifiedDATBlock(dim, nh, ws, ffn_exp, aim_re, btype, dp_rates[i], num_dict_tokens))
+        self.blocks = nn.ModuleList(blocks)
+        self.conv = nn.Conv2d(dim, dim, 3, 1, 1, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        x_seq = x.reshape(B, C, H * W).transpose(1, 2).contiguous()
+        for block in self.blocks:
+            if self.use_checkpoint and self.training:
+                x_seq = checkpoint(block, x_seq, H, W, use_reentrant=False)
+            else:
+                x_seq = block(x_seq, H, W)
+        return self.conv(x_seq.transpose(1, 2).reshape(B, C, H, W)) + x
+
+
+@ARCH_REGISTRY.register()
+class FDATRD(nn.Module):
+    def __init__(self, num_in_ch=3, num_out_ch=3, scale=4, embed_dim=128, num_groups=4,
+                 depth_per_group=2, num_heads=4, split_size=(10, 30), num_dict_tokens=128,
+                 ffn_expansion_ratio=2.0, aim_reduction_ratio=8, group_block_pattern=None,
+                 drop_path_rate=0.1, mid_dim=64, upsampler_type: SampleMods3 = "transpose+conv",
+                 img_range=1.0, unshuffle_mod=False, use_checkpoint=False) -> None:
+        super().__init__()
+        assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
+        if group_block_pattern is None:
+            group_block_pattern = ["spatial", "channel", "dictionary"]
+        self.upscale = scale
+        align = math.lcm(int(split_size[0]), int(split_size[1]))
+        self.pad = align
+        if unshuffle_mod and scale < 3:
+            unshuffle = 4 // scale
+            scale = 4
+            self.conv_first = nn.Sequential(
+                nn.PixelUnshuffle(unshuffle),
+                nn.Conv2d(num_in_ch * unshuffle**2, embed_dim, 3, 1, 1, bias=True))
+            self.pad = unshuffle * align
+        else:
+            self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1, bias=True)
+
+        ad = depth_per_group * len(group_block_pattern)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_groups * ad)]
+        spatials_per_group = sum(
+            1 for j in range(ad) if group_block_pattern[j % len(group_block_pattern)] == "spatial")
+        self.groups = nn.Sequential(*[
+            SimplifiedResidualGroup(
+                embed_dim, ad, num_heads, split_size, ffn_expansion_ratio, aim_reduction_ratio,
+                group_block_pattern, dpr[i * ad:(i + 1) * ad], num_dict_tokens,
+                start_parity=(i * spatials_per_group) % 2, use_checkpoint=use_checkpoint)
+            for i in range(num_groups)])
+        self.conv_after = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1, bias=False)
+        self.upsampler = UniUpsampleV3(upsampler_type, scale, embed_dim, num_out_ch, mid_dim, 4)
+        self.apply(self._init_weights)
+
+    def load_state_dict(self, state_dict: StateDict, *args, **kwargs) -> _IncompatibleKeys:
+        if hasattr(self.upsampler, "MetaUpsample"):
+            state_dict["upsampler.MetaUpsample"] = self.upsampler.MetaUpsample
+        return super().load_state_dict(state_dict, *args, **kwargs)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv2d):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+            if getattr(m, "bias", None) is not None:
+                nn.init.constant_(m.bias, 0)
+            if getattr(m, "weight", None) is not None:
+                nn.init.constant_(m.weight, 1.0)
+
+    def check_img_size(self, x: Tensor, h: int, w: int) -> Tensor:
+        if self.pad == 0:
+            return x
+        mod_pad_h = (self.pad - h % self.pad) % self.pad
+        mod_pad_w = (self.pad - w % self.pad) % self.pad
+        mode = "replicate" if (mod_pad_h >= h or mod_pad_w >= w) else "reflect"
+        return F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode)
+
+    def forward(self, x: Tensor) -> Tensor:
+        _, _, h, w = x.shape
+        x = self.check_img_size(x, h, w)
+        x_shallow = self.conv_first(x)
+        x_deep = self.conv_after(self.groups(x_shallow))
+        return self.upsampler(x_deep + x_shallow)[:, :, :h * self.upscale, :w * self.upscale]
+
+
+def _build(embed_dim, num_heads, num_groups, num_dict_tokens, drop_path_rate=0.1, **kw) -> FDATRD:
+    d = dict(num_in_ch=3, num_out_ch=3, scale=4, depth_per_group=2, split_size=(10, 30),
+             ffn_expansion_ratio=2.0, aim_reduction_ratio=8, group_block_pattern=None,
+             upsampler_type="transpose+conv", img_range=1.0, unshuffle_mod=False, use_checkpoint=False)
+    d.update(kw)
+    return FDATRD(embed_dim=embed_dim, num_heads=num_heads, num_groups=num_groups,
+                  num_dict_tokens=num_dict_tokens, drop_path_rate=drop_path_rate, **d)
+
+
+@ARCH_REGISTRY.register()
+def fdat_rd_small(**kw) -> FDATRD:
+    return _build(96, 3, 4, 64, **kw)
+
+
+@ARCH_REGISTRY.register()
+def fdat_rd_medium(**kw) -> FDATRD:
+    return _build(128, 4, 4, 128, **kw)
+
+
+@ARCH_REGISTRY.register()
+def fdat_rd_large(**kw) -> FDATRD:
+    return _build(192, 6, 6, 256, drop_path_rate=0.15, **kw)
+
+
+@ARCH_REGISTRY.register()
+def fdat_rd_aligned(**kw) -> FDATRD:
+    return fdat_rd_medium(**kw)
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    for name, fn in (("small", fdat_rd_small), ("medium", fdat_rd_medium), ("large", fdat_rd_large)):
+        m = fn(scale=2, unshuffle_mod=True).eval()
+        n_par = sum(p.numel() for p in m.parameters())
+        with torch.no_grad():
+            y1 = m(torch.randn(1, 3, 120, 120))
+            y2 = m(torch.randn(1, 3, 130, 118))
+            y3 = m(torch.randn(1, 3, 24, 24))
+        assert tuple(y1.shape) == (1, 3, 240, 240)
+        assert tuple(y2.shape) == (1, 3, 260, 236)
+        assert tuple(y3.shape) == (1, 3, 48, 48)
+        print(f"{name:7s} params={n_par/1e6:5.2f}M -> clean {tuple(y1.shape)} ragged {tuple(y2.shape)} tiny {tuple(y3.shape)}")
+    mc = fdat_rd_small(scale=2, unshuffle_mod=True, use_checkpoint=True).train()
+    x = torch.randn(1, 3, 120, 120, requires_grad=True)
+    mc(x).sum().backward()
+    print("checkpoint train/backward OK")
