@@ -1,7 +1,7 @@
 # fdat_rd — FDAT body + rectangular alternating windows + token-dictionary
 # cross-attention (spandrel arch). Self-contained: bundled upsampler stack &
 # DropPath, imports only StateDict + store_hyperparameters from spandrel
-# (no spandrel.util.timm / einops / numpy).
+# (matches fdat2; no spandrel.util.timm / einops / numpy).
 from __future__ import annotations
 
 import math
@@ -469,6 +469,12 @@ class FDATRD(nn.Module):
         if group_block_pattern is None:
             group_block_pattern = ["spatial", "channel", "dictionary"]
         super().__init__()
+        split_size = tuple(split_size)
+        if split_size != (10, 30):
+            raise ValueError(
+                f"FDATRD window split_size is fixed at (10, 30); got {split_size}. "
+                "Only its product survives in rel_pos_bias, so the factorization is "
+                "not recoverable from a checkpoint and is no longer a tunable.")
         self.img_range, self.upscale = img_range, scale
         align = math.lcm(int(split_size[0]), int(split_size[1]))
         self.pad = align
