@@ -11,7 +11,7 @@ Converts: PyTorch (.pth/.pt), SafeTensors, ONNX (static / dynamic).
 
 Usage:
     # 2x unshuffle, 720x540 input -> 1080p, static ONNX (H W = 540 720), verified:
-    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720 --split-size 10 30
+    python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 540 720
 
     # tiny aligned verify first, then big export on GPU, no verify:
     python fdat_rd_converter.py model.safetensors -f onnx-static --input-size 60 60
@@ -21,8 +21,8 @@ Usage:
     python fdat_rd_converter.py model.pth -f all
 
 Notes:
-    * --split-size carries the rectangular factorization (default 10 30); the
-      spatial bias only stores the window product (s0*s1), validated.
+    * The window split is fixed at (10, 30); the spatial bias only stores the
+      window product (s0*s1 = 300), validated against the checkpoint.
     * scale is inferred for unshuffle models (in_ch 12 -> 2x, 48 -> 1x).
 """
 
@@ -464,6 +464,10 @@ class FDATRD(nn.Module):
                  drop_path_rate=0.1, mid_dim=64, upsampler_type="transpose+conv",
                  img_range=1.0, unshuffle_mod=False, **kw):
         super().__init__()
+        split_size = tuple(split_size)
+        if split_size != (10, 30):
+            raise ValueError(
+                f"FDATRD window split_size is fixed at (10, 30); got {split_size}.")
         if group_block_pattern is None:
             group_block_pattern = ["spatial", "channel", "dictionary"]
         self.upscale = scale
@@ -575,8 +579,9 @@ def detect_model_params(sd, split_size):
         if b in sd:
             prod = sd[b].shape[1]
             if prod != s0 * s1:
-                print(f"  WARNING: --split-size {split_size} product {s0*s1} "
-                      f"!= detected window product {prod}. Fix --split-size.")
+                print(f"  WARNING: checkpoint window product {prod} != expected "
+                      f"{s0*s1} for the fixed (10, 30) split. This does not look "
+                      f"like a standard FDAT-RD checkpoint.")
             break
     for bi in range(len(types)):
         b = f"groups.0.blocks.{bi}.attn.dictionary"
@@ -740,7 +745,6 @@ def main():
     ap.add_argument("-f", "--formats", nargs="+", default=["fp32"],
                     choices=["fp32", "fp16", "safetensors", "onnx-static", "onnx-dynamic", "all"])
     ap.add_argument("--scale", type=int)
-    ap.add_argument("--split-size", type=int, nargs=2, default=[10, 30])
     ap.add_argument("--num-dict-tokens", type=int)
     ap.add_argument("--upsampler")
     ap.add_argument("--unshuffle-mod", action="store_true")
@@ -756,8 +760,6 @@ def main():
     override = {}
     if args.scale:
         override["scale"] = args.scale
-    if args.split_size:
-        override["split_size"] = tuple(args.split_size)
     if args.num_dict_tokens:
         override["num_dict_tokens"] = args.num_dict_tokens
     if args.upsampler:
@@ -765,7 +767,7 @@ def main():
     if args.unshuffle_mod:
         override["unshuffle_mod"] = True
 
-    model, params = load_model(args.input, args.device, args.split_size, override or None)
+    model, params = load_model(args.input, args.device, (10, 30), override or None)
     model = model.to(args.device)
     print_model_info(model, params)
     if args.info:
