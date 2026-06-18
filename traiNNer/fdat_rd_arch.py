@@ -201,6 +201,12 @@ class FDATRD(nn.Module):
                  img_range=1.0, unshuffle_mod=False, use_checkpoint=False) -> None:
         super().__init__()
         assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
+        split_size = tuple(split_size)
+        if split_size != (10, 30):
+            raise ValueError(
+                f"FDATRD window split_size is fixed at (10, 30); got {split_size}. "
+                "Only its product survives in rel_pos_bias, so the factorization is "
+                "not recoverable from a checkpoint and is no longer a tunable.")
         if group_block_pattern is None:
             group_block_pattern = ["spatial", "channel", "dictionary"]
         self.upscale = scale
@@ -266,28 +272,23 @@ class FDATRD(nn.Module):
         return self.upsampler(x_deep + x_shallow)[:, :, :h * self.upscale, :w * self.upscale]
 
 
-def _build(embed_dim, num_heads, num_groups, num_dict_tokens, drop_path_rate=0.1, **kw) -> FDATRD:
-    d = dict(num_in_ch=3, num_out_ch=3, scale=4, depth_per_group=2, split_size=(10, 30),
-             ffn_expansion_ratio=2.0, aim_reduction_ratio=8, group_block_pattern=None,
-             upsampler_type="transpose+conv", img_range=1.0, unshuffle_mod=False, use_checkpoint=False)
-    d.update(kw)
+@ARCH_REGISTRY.register()
+def fdat_rd_small(embed_dim=96, num_heads=3, num_groups=4, num_dict_tokens=64, **kw) -> FDATRD:
     return FDATRD(embed_dim=embed_dim, num_heads=num_heads, num_groups=num_groups,
-                  num_dict_tokens=num_dict_tokens, drop_path_rate=drop_path_rate, **d)
+                  num_dict_tokens=num_dict_tokens, **kw)
 
 
 @ARCH_REGISTRY.register()
-def fdat_rd_small(**kw) -> FDATRD:
-    return _build(96, 3, 4, 64, **kw)
+def fdat_rd_medium(embed_dim=128, num_heads=4, num_groups=4, num_dict_tokens=128, **kw) -> FDATRD:
+    return FDATRD(embed_dim=embed_dim, num_heads=num_heads, num_groups=num_groups,
+                  num_dict_tokens=num_dict_tokens, **kw)
 
 
 @ARCH_REGISTRY.register()
-def fdat_rd_medium(**kw) -> FDATRD:
-    return _build(128, 4, 4, 128, **kw)
-
-
-@ARCH_REGISTRY.register()
-def fdat_rd_large(**kw) -> FDATRD:
-    return _build(192, 6, 6, 256, drop_path_rate=0.15, **kw)
+def fdat_rd_large(embed_dim=192, num_heads=6, num_groups=6, num_dict_tokens=256,
+                  drop_path_rate=0.15, **kw) -> FDATRD:
+    return FDATRD(embed_dim=embed_dim, num_heads=num_heads, num_groups=num_groups,
+                  num_dict_tokens=num_dict_tokens, drop_path_rate=drop_path_rate, **kw)
 
 
 @ARCH_REGISTRY.register()
